@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "io.github.luwojtaszek.alt-tab",
+  "id": "allpan3.omarchy-alt-tab",
   "name": "Alt-Tab Switcher",
-  "version": "1.1.0",
-  "author": "Lukasz Wojtaszek",
+  "version": "1.1.0-allpan3.1",
+  "author": "Lukasz Wojtaszek; local adaptations for allpan3",
   "license": "MIT",
-  "description": "macOS-style Alt-Tab window switcher: MRU order, hold-and-cycle, type-to-filter, same-app and same-workspace modes. Follows your Omarchy theme; binds itself out of the box.",
+  "description": "Searchable window switcher with manual shortcuts, Alt/Super/Ctrl release selection and Shift-press reverse cycling.",
   "kinds": [
     "menu",
     "service"

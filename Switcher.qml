@@ -1,4 +1,5 @@
 import Quickshell
+import Quickshell.Io
 import Quickshell.Wayland
 import Quickshell.Widgets
 import Quickshell.Hyprland
@@ -8,12 +9,9 @@ import "WindowModel.js" as WindowModel
 
 // macOS-style Alt-Tab window switcher, an Omarchy "menu" plugin.
 //
-// Summoned from a Hyprland bind while Alt is held:
-//   bind = ALT, Tab, exec, omarchy-shell shell summon io.github.luwojtaszek.alt-tab '{"dir":"next"}'
-//   bind = ALT SHIFT, Tab, exec, omarchy-shell shell summon io.github.luwojtaszek.alt-tab '{"dir":"prev"}'
-// Repeated summons cycle the selection; releasing Alt focuses the selected
-// window. Typing latches the switcher into sticky mode (filter; Enter/Escape
-// only). Payload options: dir ("next"/"prev"), variant ("two-line"/"bare").
+// Bind Alt+Tab manually as shown in README.md. Repeated named
+// summons cycle; releasing the configured modifier selects. Typing latches
+// sticky search (Enter/Escape). This local fork adds Ctrl and Shift-alone handling.
 //
 // The window list is the shell's own Hyprland model (Hyprland.toplevels):
 // no subprocess, no JSON to parse, nothing to buffer. Each window
@@ -33,7 +31,7 @@ Item {
   property var service: null // the host hands over this plugin's Service.qml instance
   property bool opened: false
 
-  readonly property string pluginId: manifest && manifest.id ? String(manifest.id) : "io.github.luwojtaszek.alt-tab"
+  readonly property string pluginId: manifest && manifest.id ? String(manifest.id) : ""
 
   // ── Bounds ─────────────────────────────────────────────────────────
   readonly property int maxWindows: 256 // windows kept from the compositor's model, MRU first
@@ -53,8 +51,10 @@ Item {
   property int selectedIndex: 0
   property bool sticky: false         // typing latched: only Enter/Escape close
   property bool revealed: false       // show-delay gate: a quick tap never renders
-  property bool holdOpen: false       // demo/debug: stay open, ignore Alt release
-  property string modifier: "alt"     // key whose release commits: "alt", "super"
+  property bool holdOpen: false       // demo/debug: stay open, ignore modifier release
+  property bool shiftPressReverses: true
+  property int sessionSerial: 0
+  property string modifier: "alt"     // key whose release commits: "ctrl", "alt", "super"
                                       // or "none" (picker: Enter/Escape only)
 
   // Hyprland >= 0.56 in Lua-config mode rejects classic dispatcher syntax.
@@ -98,14 +98,17 @@ Item {
       // repeated summons only cycle.
       mode = (payload.mode === "sameclass" || payload.mode === "sameworkspace")
         ? payload.mode : "all"
-      // {"hold": true} keeps the switcher up regardless of the Alt state —
+      // {"hold": true} keeps the switcher up regardless of the modifier state —
       // for screenshots, demos and debugging.
       holdOpen = payload.hold === true
       // Which modifier the summoning bind holds; its release commits the
-      // selection. Keep in sync with the bind (the bind writer does this
-      // through alt-tab.json's "modifier").
-      modifier = (payload.modifier === "super" || payload.modifier === "none")
+      // selection. Set it in the binding payload; Alt is the default.
+      modifier = (payload.modifier === "ctrl" || payload.modifier === "super" || payload.modifier === "none")
         ? payload.modifier : "alt"
+      shiftPressReverses = payload.shiftPressReverses !== false
+      sessionSerial++
+      pendingFocusAddress = ""
+      focusTimer.stop()
       refClass = ""
       sticky = false
       revealed = false
@@ -124,11 +127,119 @@ Item {
   }
 
   function close() {
+    sessionSerial++
     opened = false
     revealTimer.stop()
+    releaseDelay.stop()
   }
 
   function ping() { return "ok" }
+
+  IpcHandler {
+    enabled: root.pluginId !== ""
+    target: root.pluginId
+    function shiftPress(modifiers: string): void { root.shiftPressed(modifiers) }
+  }
+
+  // xremap's existing copy/paste rules emit Ctrl+Insert and Shift+Insert.
+  // Interpret those as the typed C/V inside this Ctrl-based picker. No clipboard
+  // action runs here. Typing makes the picker sticky so Ctrl can be released.
+  function typedCharacter(event) {
+    if (modifier === "ctrl" && event.key === Qt.Key_Insert) {
+      if (event.modifiers & Qt.ShiftModifier) return "v"
+      if (event.modifiers & Qt.ControlModifier) return "c"
+    }
+    var ch = event.text
+    if ((!ch || ch.charCodeAt(0) < 32) && event.key >= Qt.Key_A && event.key <= Qt.Key_Z)
+      ch = String.fromCharCode(97 + event.key - Qt.Key_A)
+    return ch && ch.length === 1 && ch.charCodeAt(0) >= 32 && ch.charCodeAt(0) !== 127 ? ch : ""
+  }
+
+  // Modifier key events can be filtered before Qt's Keys handlers see them.
+  // input.lua forwards only actual Shift press edges from Hyprland. Keep this
+  // as the single cycling path so a Qt event cannot cause a second step.
+  function shiftPressed(modifiers) {
+    if (!opened || sticky || !shiftPressReverses) return
+    if (String(modifiers).split(",").indexOf(modifier) < 0) return
+    cycle(-1)
+  }
+
+  function keyPressed(event) {
+    if (!opened) return
+    if (event.key === Qt.Key_Shift) {
+      // The compositor observer handles this, including repeat suppression.
+      event.accepted = true
+    } else if (event.key === Qt.Key_Escape) {
+      dismiss()
+    } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+      activate()
+    } else if (event.key === Qt.Key_Tab || event.key === Qt.Key_QuoteLeft) {
+      cycle(event.modifiers & Qt.ShiftModifier ? -1 : 1)
+    } else if (event.key === Qt.Key_Down) {
+      cycle(1)
+    } else if (event.key === Qt.Key_Backtab || event.key === Qt.Key_Up) {
+      cycle(-1)
+    } else if (event.key === Qt.Key_Backspace) {
+      filterText = filterText.slice(0, -1)
+      applyFilter()
+    } else if (variant === "bare" && !sticky && event.key >= Qt.Key_1 && event.key <= Qt.Key_9) {
+      var idx = event.key - Qt.Key_1
+      if (idx < visibleRows.length) { select(viewStart + idx); activate() }
+    } else {
+      var ch = typedCharacter(event)
+      if (!ch) return
+      if (filterText.length < maxFilter) filterText += ch
+      sticky = true
+      revealed = true
+      selectedIndex = 0
+      applyFilter()
+    }
+    event.accepted = true
+  }
+
+  function keyReleased(event) {
+    var isModifier = modifier === "ctrl" ? event.key === Qt.Key_Control
+      : modifier === "super" ? (event.key === Qt.Key_Super_L || event.key === Qt.Key_Super_R || event.key === Qt.Key_Meta)
+      : modifier === "alt" && event.key === Qt.Key_Alt
+    if (isModifier && !sticky && autoCommit) {
+      // xremap can briefly release Ctrl while emitting a different chord.
+      // Query after that chord has settled instead of selecting mid-sequence.
+      releaseDelay.restart()
+      event.accepted = true
+    }
+  }
+
+  function checkModifier() {
+    if (!opened || sticky || !autoCommit || modifierCheck.running) return
+    modifierCheck.forSession = sessionSerial
+    modifierCheck.running = true
+  }
+
+  function modifierResult(text, serial) {
+    if (!opened || sticky || !autoCommit || serial !== sessionSerial) return
+    // Only a recognized answer can select; a failed IPC query leaves it open.
+    if (text.trim().endsWith("SWITCHER_MODIFIER:false")) activate()
+  }
+
+  Timer { id: releaseDelay; interval: 20; onTriggered: root.checkModifier() }
+  Timer {
+    interval: 80
+    running: root.opened && root.autoCommit && !root.sticky
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.checkModifier()
+  }
+  Process {
+    id: modifierCheck
+    property int forSession: -1
+    readonly property string keyPrefix: root.modifier === "ctrl" ? "Control" : root.modifier === "super" ? "Super" : "Alt"
+    // Hyprland eval discards return values. Its error response carries this
+    // read-only result back over IPC, without changing compositor state.
+    command: ["timeout", "1", "hyprctl", "eval",
+      'error("SWITCHER_MODIFIER:" .. tostring(hl.is_key_down("' + keyPrefix + '_L") or hl.is_key_down("' + keyPrefix + '_R")), 0)']
+    stdout: StdioCollector { onStreamFinished: root.modifierResult(text, modifierCheck.forSession) }
+  }
+
 
   // ── MRU window list ────────────────────────────────────────────────
   // The focus history lives in Service.qml. Look it up live first (the
@@ -335,7 +446,7 @@ Item {
     visible: root.opened
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
-    WlrLayershell.namespace: "omarchy-alt-tab"
+    WlrLayershell.namespace: root.pluginId
     WlrLayershell.layer: WlrLayer.Overlay
     WlrLayershell.keyboardFocus: root.opened ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
     exclusionMode: ExclusionMode.Ignore
@@ -579,7 +690,7 @@ Item {
             spacing: 18
 
             Repeater {
-              model: [["tab", "next"], ["⇧tab", "prev"], ["↵", "focus"], ["esc", "cancel"]]
+              model: [["tab", "next"], [root.shiftPressReverses ? "⇧" : "⇧tab", "prev"], ["type", "search"], ["↵", "focus"], ["esc", "cancel"]]
               delegate: Row {
                 required property var modelData
                 spacing: 5
@@ -611,58 +722,8 @@ Item {
       anchors.fill: parent
       focus: true
       Keys.priority: Keys.BeforeItem
-      Keys.onPressed: function (event) {
-        if (event.key === Qt.Key_Escape) {
-          root.dismiss()
-        } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-          root.activate()
-        } else if (event.key === Qt.Key_Tab || event.key === Qt.Key_Down
-            || event.key === Qt.Key_QuoteLeft) {
-          root.cycle(1)
-        } else if (event.key === Qt.Key_Backtab || event.key === Qt.Key_Up) {
-          root.cycle(-1)
-        } else if (event.key === Qt.Key_Backspace) {
-          if (root.filterText.length > 0) {
-            root.filterText = root.filterText.slice(0, -1)
-            root.applyFilter()
-          }
-        } else if (root.variant === "bare" && !root.sticky
-            && event.key >= Qt.Key_1 && event.key <= Qt.Key_9) {
-          // bare: alt+<n> activates the n-th row on screen directly
-          var idx = event.key - Qt.Key_1
-          if (idx < root.visibleRows.length) {
-            root.select(root.viewStart + idx)
-            root.activate()
-          }
-        } else {
-          // Printable characters go into the filter. With Alt held Qt may
-          // leave event.text empty for letters, so fall back to the key code.
-          var ch = event.text
-          if ((!ch || ch.charCodeAt(0) < 32) && event.key >= Qt.Key_A && event.key <= Qt.Key_Z)
-            ch = String.fromCharCode(97 + (event.key - Qt.Key_A))
-          if (ch && ch.length === 1 && ch.charCodeAt(0) >= 32 && ch.charCodeAt(0) !== 127) {
-            if (root.filterText.length < root.maxFilter) root.filterText += ch
-            root.sticky = true
-            root.applyFilter()
-          } else {
-            return
-          }
-        }
-        event.accepted = true
-      }
-
-      // Alt release: this surface holds exclusive keyboard focus, so the
-      // compositor delivers the release here — the primary activation path.
-      // Typing latches sticky mode; then only Enter/Escape close.
-      Keys.onReleased: function (event) {
-        var isModifier = root.modifier === "super"
-          ? (event.key === Qt.Key_Super_L || event.key === Qt.Key_Super_R || event.key === Qt.Key_Meta)
-          : event.key === Qt.Key_Alt
-        if (isModifier && !root.sticky && root.autoCommit) {
-          root.activate()
-          event.accepted = true
-        }
-      }
+      Keys.onPressed: function (event) { root.keyPressed(event) }
+      Keys.onReleased: function (event) { root.keyReleased(event) }
     }
   }
 }
